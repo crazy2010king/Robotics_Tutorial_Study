@@ -1,0 +1,2 @@
+- 1. 请使用非专业人士，就是大多数普通人能够听懂的方式，通俗易懂的详细深入的讲解下面图片中的内容，要求对其中的公式进行全面深入的讲解，同样对补充必要的基础内容也进行全面的讲解(/mnt/tfbot_s2_doc/open_source/Robotics_Tutorial_Study/mit_study/1/1/image.png)
+
