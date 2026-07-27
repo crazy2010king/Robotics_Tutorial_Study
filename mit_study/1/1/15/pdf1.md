@@ -1,604 +1,861 @@
-# 用大白话讲透《Underactuated Robotics》第12章：基于采样的运动规划（Sampling-based Motion Planning）
+# 用大白话讲透《Underactuated Robotics》第15章：输出反馈（又名"从像素到力矩"）
 
-> 前面第7章讲了动态规划，第9章讲了李雅普诺夫稳定性，第11章讲了策略搜索。这一章要打开另一扇门：**当机器人面对的环境极其复杂（比如一堆障碍物中间穿行），或者优化地形非常"坑洼"（非凸，容易卡在局部最优）时，前面的方法都可能失效。怎么办？——"撒点采样"大法**。
+> 前面14章我们一直在"作弊"——假设机器人**完全知道自己的状态**（位置、速度、姿态……全都精确无误），然后设计反馈控制器。
 >
-> 核心思想特别直白：**别试图把整个空间算清楚，而是随机撒一些点，只检查这些点有没有撞墙，再把能连起来的点用线连起来，形成一张"路线图"或"树"，然后在图上搜路径**。
+> 但现实是：**机器人只能通过传感器看世界**。摄像头看到的是像素、编码器读到的是角度、IMU 测到的是加速度——这些信息**有噪声、不完整、有延迟**。
+>
+> 这一章要解决一个核心问题：**"当机器人只能看到'y'（输出）而非'x'（真实状态）时，怎么设计控制器？"** 书名副标题"Pixels-to-Torques"（从像素到力矩）说的就是这件事 。
 >
 > 下面我用完全通俗的方式，把这一章从头到尾拆给你看，并配上代码实践说明。
 
 ---
 
-## 🗺️ 一、为什么需要"采样"？——从网格 discretize 的崩溃说起
+## 👁️ 一、为什么"输出反馈"是个难题？
 
-### 1.1 回忆：之前的做法是"铺网格"
+### 1.1 之前14章的"作弊"
 
-在第7章动态规划里，我们把状态空间切成一个个格子，然后在格子上做图搜索。这种方法叫"resolution complete"（分辨率完备）——只要格子足够细，就能找到路径。
+回想我们之前做的所有事：
+- 第7章动态规划：假设知道 x
+- 第11章策略搜索：假设知道 x
+- 第14章反馈运动规划：假设知道 x 来切换漏斗
 
-**但问题是**：格子数量随维度指数爆炸。
+教材坦白：**"most of our discussions until now have tacitly assumed that we have access to the true state"**——我们之前默认能拿到真实状态，这已经是很难的问题了 。
 
-📌 **直观例子**：一个6自由度的机械臂，每个关节如果离散成100个位置，那么总格子数是 100⁶ = 10¹² 个。现代CPU每秒处理10⁸个操作的话，需要**超过1小时**才能遍历一遍——而且这只是6维！
+### 1.2 现实世界的状态"看不见"
 
-如果是人形机器人的全身规划（几十个自由度），格子数会是天文数字，**宇宙年龄都不够用**。
+现在我们把系统写成：
+$$\begin{align*}x[n+1]&=f(x[n], u[n], w[n])\\ y[n]&=g(x[n], u[n], v[n])\end{align*}$$
 
-### 1.2 采样的天才想法
+其中 y 是**输出**（传感器测量值），v 是**测量噪声** 。
 
-**与其把整个空间铺满，不如随机撒点**：
-- 在构型空间里**均匀随机采样**
-- 丢掉撞墙的点
-- 留下自由空间里的点作为"路标"
-- 把两个路标之间能直线相连且不撞墙的，用边连起来
+📌 **关键认知**：x 是"真实状态"，y 是"看到的输出"。两者之间有三条鸿沟：
+1. **维度鸿沟**：y 的维度 ≤ x 的维度（传感器比状态少）
+2. **噪声鸿沟**：y 被 v 污染（测量有噪声）
+3. **非线性鸿沟**：g() 可能不是 x 的简单线性函数（摄像头输出是像素，不是角度）
 
-这样建出来的图叫**"概率路线图"（Probabilistic Roadmap, PRM）**。
+### 1.3 一个生动的类比：雾中开船
 
-> 💡 **关键洞察**：采样规划放弃了"绝对完备性"，换取了"概率完备性"——采样点越多，找到路径的概率越趋近1。这是一个**用概率换效率**的绝妙权衡。
+想象你在浓雾中开船：
+- **真实状态 x**：船的精确位置、速度、朝向
+- **输出 y**：雷达回波、GPS 信号（有噪声）
+- **控制 u**：舵角、油门
+- **目标**：到达港口
 
-### 1.3 这一章要解决什么问题
+你**看不到**船的真实位置，只能根据雷达回波+GPS 来"估计"位置，然后决定舵角。这就是输出反馈问题。
 
-教材开门见山 ：
-- **几何复杂**的问题（机器人在3D障碍物间穿行）
-- **优化地形非常非凸**的问题（之前的非线性轨迹优化容易卡在局部最小值）
+### 1.4 教材的两个重要观察
 
-这两类问题恰恰是**采样方法的主场**。
+**观察1**：有时"全状态反馈"假设没那么糟——我们确实有好的状态估计工具（Kalman 滤波等）。但**即使是最好
+的估计算法，也会给系统引入额外的动力学**（滤波器本身有动态）。如果**滤波器的时间常数接近系统本身的时间常数**，就必须把估计器的动力学纳入闭环分析 。
+
+**观察2**：有时假设"能估计全状态"过于乐观。有些状态变量**完全不可观**（unobservable），有些需要控制器执行特定的**"信息收集"动作**才能观测到 。
+
+### 1.5 机器人操作的典型案例
+
+教材举了两个绝佳例子 ：
+
+**例子1：给衬衫扣纽扣**
+- 要设计控制器让机器人给衬衫扣纽扣
+- 传统工具要求先估计"衬衫的状态"——但衬衫有**多少个自由度**？袖子、领口、下摆……几乎无限！
+- 然而，**扣一颗纽扣根本不需要知道衬衫的完整状态**
+
+**例子2：做沙拉**
+- 编程让机器人做沙拉
+- "沙拉的状态"是什么？难道我需要知道每一片生菜的位置和速度才能成功吗？
+
+> 💡 **核心洞察**：许多任务**不需要全状态**——我们需要的是"任务相关的状态表示"（task-relevant state representation）。这正是当今"学习状态表示"研究的核心问题，而输出反馈控制理论能为此提供基础教训。
 
 ---
 
-## 🔍 二、大规模增量搜索：A* 算法
+## 📻 二、15.1 背景：经典控制的智慧
 
-### 2.1 从"下棋AI"到"找路径"
+### 2.1 经典控制本来就是"输出反馈"
 
-历史上，人工智能研究者们一直相信：**智能 = 大知识库 + 高效搜索**。从Samuel的跳棋程序、自动化定理证明、Deep Blue下棋，都是这个思路。
+教材指出一个有趣的历史事实 ：在"现代控制"（状态空间+优化）出现之前，**经典控制研究的就是输出反馈**。核心概念是**传递函数（transfer function）**——一个在频域描述的输入到输出的映射，能完整刻画 LTI 系统。
 
-这些算法的核心是**在巨大图上做最短路径搜索**。如果我们要从起点到终点找一条最优路径，最暴力的方法是**遍历整个图**——但图太大了，内存根本放不下。
+经典工具：**极点配置（pole placement）**和**回路整形（loop shaping）**——本质上都是在解决我们现在讨论的输出反馈挑战。
 
-**增量搜索（Incremental Search）**的思想：不把整个图放内存，而是**边搜边建**，只探索"有可能包含最优路径"的区域。
+### 2.2 现代控制的"得与失"
 
-### 2.2 A* 算法：用"启发式"引导搜索
+教材诚恳地反思 ：
+> "Sometimes I feel that, despite all of the things we've gained with modern, optimization-based control, I worry that we've lost something..."
 
-A* 是这方面最著名的算法。它的核心思想特别直观，就像你**在手机上看地图导航**：
+**得到了**：优化框架、状态空间方法、H₂/H∞ 控制
+**可能失去了**：对闭环性能丰富特征的考量（上升时间、驻留时间、超调……），以及对未建模误差的实际鲁棒性
 
-📌 **类比**：你从北京开车去广州，手机导航软件怎么做？
-- 它不会先把"北京到广州之间所有城市的每一条路"都存下来
-- 它会优先探索"朝着广州方向"的路
-- 怎么判断"朝着广州方向"？用**直线距离**（"as the crow flies"）作为启发——直线距离永远不会高估真实路程
+### 2.3 从像素到力矩：深度学习的革命
 
-这就是A*的**可采纳启发式（Admissible Heuristic）**：
-$$\tilde{h}(v) \leq h(v), \forall v \in V$$
-即：估计的"剩余代价"永远不会超过真实的"剩余代价"。
+现代方法用深度学习直接从像素学到控制 ：
+- **模仿学习（Imitation Learning）**：从专家演示中学 π(pixels)→torques
+- **深度强化学习（Deep RL）**：直接从像素学习策略
 
-### 2.3 A* 算法的精确步骤
+**模仿学习的局限**：它本质上是"监督学习"——把像素映射到力矩。要泛化到训练数据之外的状态，或者在新任务上泛化（语言条件的多任务框架），模仿学习者必须**获取世界的隐式状态表示**。
 
-教材给出了Algorithm 12.1（离散A*）：
+**强化学习的局限**：虽然 RL 确实在解决困难的控制问题，但目前仍需要大量的引导（代价函数/环境调优）和**惊人的计算量**。有趣的是，RL 中常见做法是：**先解决全状态反馈问题，然后用"教师-学生"框架（也是一种模仿学习）把全状态反馈控制器蒸馏成输出反馈控制器** 。
+
+> 💡 **教材的核心目标**：总结控制理论中的关键教训，希望能为机器学习与控制理论的融合提供指引 。
+
+---
+
+## 🚫 三、15.2 静态输出反馈：一个"几乎不可能"的问题
+
+### 3.1 什么叫做"静态输出反馈"？
+
+最简单的想法：既然看不到 x，那就直接用 y 做反馈：
+$$u = \pi(y)$$
+
+这叫**静态输出反馈**——控制器是输出的**静态函数**（无记忆、无内部状态）。
+
+相对地，**动态输出反馈**的控制器本身是一个动力学系统（有记忆、有内部状态）。
+
+### 3.2 震惊的结果：静态输出反馈是 NP-hard！
+
+教材给出了一个**令人沮丧的理论结果** ：
+
+考虑线性系统：
+$$\dot{x}=A x+B u, \quad y=C x$$
+
+Blondel & Tsitsiklis (1997) 证明：**判断是否存在一个稳定的静态输出反馈 $u = -K y$，这个问题是 NP-hard 的** 。
+
+这意味着什么？
+- 除非 P = NP，否则**不存在多项式时间算法**能解决这个问题
+- 稳定增益 K 的集合不仅**非凸**，甚至可能**不连通**（disconnected）
+
+### 3.3 一个具体的反例（Megretski 的例子）
+
+教材给出了一个简洁的三阶系统 ：
+$$A = \begin{bmatrix} 0 & 0 & 2 \\ 1 & 0 & 0 \\ 0 & 1 & 0\end{bmatrix}, \quad B = \begin{bmatrix} 1 \\ 0 \\ 0 \end{bmatrix}, \quad C = \begin{bmatrix} 1 & 1 & 3 \end{bmatrix}$$
+
+静态输出反馈是 $u = -k y$（只有一个标量参数 k）。教材绘制了闭环系统最大特征值的实部随 k 变化的曲线——**你会发现使系统稳定的 k 值集合是断开的多个区间**。
+
+📌 **直观理解**：就像在一条路上开车，稳定区域是"几个孤立的安全岛"，岛与岛之间隔着"不稳定深渊"。你不能在参数空间里连续地从
+一个稳定解移动到另一个稳定解——必须"跳跃"过不稳定区域。
+
+### 3.4 但是！NP-hard 不等于"实践中无解"
+
+教材乐观地指出 ：
+> "Just because this problem is NP-hard doesn't mean we can't find good controllers in practice."
+
+最近的强化学习成果也提醒了我们这一点。我们不应该期望有**高效的全局最优算法**能解决每个问题实例，但**绝对应该继续研究这个问题**。也许机器人在真实世界中遇到的问题类比要容易一些（线性系统中那些标准反例，如交错极点和零点，感觉有点人为构造，不太可能在实践中出现）。
+
+### 3.5 为什么只看当前测量值不够？
+
+教材用 Acrobot 和 Cart-Pole 的平衡控制举例 ：
+- 这些 LQR 控制器是**全状态**的函数（位置和速度）
+- 如果机器人只有位置传感器（如编码器），或者观察来自指向机器人的摄像头
+- **只看瞬时观察，没有任何关于关节速度的信息**
+
+虽然需要证明，但合理预期：**即使对线性化系统，这种形式的控制器也无法完成平衡任务**（从所有初始条件出发）。
+
+### 3.6 一个自然的回应：用历史观察
+
+今天的常见回应是：**让控制器成为近期观察历史的函数**。
+
+- 如果没有测量噪声，最后两个位置测量值就足以估计速度（略有延迟）
+- 如果有测量噪声，取稍长的历史可以滤除一些噪声
+
+✅ **这在正确的轨道上！** 但严格来说，这不再是"静态"控制器——它需要记忆来存储先前的观察，**记忆就是"动态"控制器的定义特征**。
+
+❓ **关键问题**：我们需要多少历史/记忆？
+
+---
+
+## 🎲 四、15.3 部分可观测马尔可夫决策过程（POMDPs）
+
+### 4.1 POMDP 的形式化
+
+有限 POMDP 是一个随机状态空间动力学系统，具有 ：
+- 离散（可能无限）状态集 S
+- 动作集 A
+- 观察集 O
+- 初始状态概率 $p_{s_0}(s)$
+- 转移概率 $p(s'|s, a)$
+- 观察概率 $p_{o|s}(o|s)$
+- 确定性代价函数 $\ell: S \times A \to \mathbb{R}$
+
+目标是最小化有限时域期望代价：
+$$E\left[\sum_{n=1}^{N}\ell(s[n],u[n])\right]$$
+
+### 4.2 信念状态（Belief State）：POMDP 的"充分条件统计量"
+
+**核心思想** ：与其显式维护不断扩展的历史，不如维护一个**对历史的充分统计量**——即**信念状态**：
+
+$$b_i[n] = P(s[n]=s_i \mid a[0]=a_0, o[0]=o_0, \ldots, a[n-1], o[n-1])$$
+
+$b[n] \in \mathcal{B}[n] \subset \Delta^{|S|}$ 是 $|S|$ 维单纯形中的概率分布。
+
+**为什么信念状态是充分的？**
+- 它捕获了历史中所有可用于预测未来状态（以及观察和代价）的信息
+- 最优策略可以写成：$a^*[n] = \pi^*(b[n], n)$
+
+### 4.3 信念状态的更新方程
+
+信念状态是**可观测的**，其最优贝叶斯估计器/观测器由下式给出 ：
+
+$$b_i[n+1] = f_i(b[n], a[n], o[n])$$
+
+其中 $b_i[0] = p_{s_0}(s_i)$，且
+
+$$f_i(b, a, o) = \frac{p_{o|s}(o|s_i) \sum_{j \in |S|} p(s_i|s_j, a) b_j}{\sum_{i \in |S|} p_{o|s}(o|s_i) \sum_{j \in |S|} p(s_i|s_j, a) b_j}$$
+
+用矩阵记号重写 ：
+$$f(b, a, o) = \frac{\text{diag}(c(o)) T(a) b}{c^T(o) T(a) b}$$
+
+其中 $c(o)$ 是列向量，$c_i(o) = p_{o|s}(o|s_i)$，$T(a)$ 是转移矩阵。
+
+### 4.4 信念 MDP
+
+通过对未来观察边缘化，可以形成用于规划的"信念 MDP"：
+
+$$p_{bMDP}(b'|b, a) = \sum_{i \in |O|} p(b'|b, a, o_i) c^T(o_i) T(a) b$$
+
+**关键结论** ：信念 MDP 的最优状态反馈策略 $\pi^*(b[n], n)$，**正是原始 POMDP 的最优输出反馈**。
+
+### 4.5 连续状态空间的信念
+
+在连续状态空间中，信念状态是一个函数 ：
+$$b(x, n) = p_{x|h}(x[n] | h[n])$$
+
+这是一个关于可能信念分布的**函数**（在有限状态情况下是 $\mathbb{R}^{|S|}$ 上的函数）。
+
+### 4.6 Example 15.1：奶酪迷宫（Cheese Maze）
+
+教材给出了 POMDP 的经典例子 ：
 
 ```
-初始化：路径 p = [起点 v_s]，访问字典 S = {v_s: p}，优先队列 Q（按 f 值排序）
-
-while Q 非空：
-    p = Q.pop()  # 取出 f 值最小的路径
-    u = p 的最后一个节点
-    if u == v_t: return p  # 到达终点，返回路径
-    
-    for v in GetSuccessors(u):  # 遍历 u 的所有后继
-        if v 不在路径 p 中:  # 避免环路
-            p' = Path(p, u)  # 扩展路径
-            if v 不在 S 中 或 g(p') < g(S[v]):  # 找到了更好的路径
-                S[v] = p'
-                Q.insert(p')
-return failure
+1 2 3 2 4
+5   5   5
+6 7 6
 ```
 
-**三个关键函数**：
-- `g(v)`：从起点到 v 的实际最小代价（cost to come）
-- `h(v)`：从 v 到终点的真实最小代价（cost to go）
-- `f(v) = g(v) + h(v)`：经过 v 的最优路径总代价
+机器人老鼠一次移动一格，观察是地图上绘制的整数标签，目标是阴影区域。
 
-**A* 使用的估计值**：
-- `g̃(p)`：路径 p 的实际代价
-- `h̃(v)`：启发式估计（永远不超过真实 h(v)）
-- `f̃(p) = g̃(p) + h̃(v)`
+**问题**：如果你被随机放置在迷宫中（均匀分布），你知道地图但不知道自己的位置。导航到目标的策略是什么？
+- 如果初始观察是 5，你需要决定：是乐观地向下移动（希望能找到目标），还是向上移动看到 1、3 或 4？
+- 如果初始观察是 2 呢？
 
-### 2.4 A* 的神奇性质
+**惊人结果**：这个特定问题的最优策略**只需要 7 个离散（信念）状态**就能表示！
 
-教材给了一个**令人惊叹的性质** ：
-
-> 如果 `h̃(v)` 是可采纳启发式，那么 A* **永远不会展开那些 `f̃(p) > f(v_s)` 的路径**。
-
-换句话说：A* 只探索"有可能成为最优路径一部分"的节点。**如果启发式恰好是真实的 cost-to-go，A* 只会访问最优路径上的节点！**
-
-反过来：
-> A* 会展开图中所有 `f̃(p) < f(v_s)` 的路径。**启发式越强（越接近真实值），搜索效率越高**。
-
-### 2.5 A* 的两个保证
-
-- **完备性（Completeness）**：如果存在路径，A* 保证能找到
-- **最优性（Optimality）**：A* 保证找到的是最优路径
-
-**A* 同时满足这两个性质** 。
-
-### 2.6 工程界的成功案例
-
-教材指出 ：AlphaGo 和 AlphaZero 把离散游戏中的规划算法（特别是**蒙特卡洛树搜索 MCTS**）与学习到的启发式（策略网络和价值网络）结合起来。而如何让大语言模型（LLM）与规划结合以支持长期推理，是当前**极其活跃的研究领域**。
-
-> 💡 **这意味着**：A* 的思想不仅在机器人运动规划中有用，它还是现代 AI（围棋、LLM 推理）的核心支柱。
+> 💡 **关键洞察**：POMDP 的信念状态空间可能很大，但通过利用问题结构，往往可以找到**紧凑的充分统计量表示**。这正是"学习状态表示"研究的核心动机。
 
 ---
 
-## 🕸️ 三、概率路线图（PRM）：把 A* 推广到连续空间
+## 🎯 五、15.4 线性系统 + 高斯噪声
 
-### 3.1 从离散到连续的鸿沟
+### 5.1 LQG：线性二次高斯控制
 
-A* 在离散图上工作得很好。但机器人的构型空间是**连续的**——怎么用 A*？
+对于线性系统 + 高斯噪声 + 二次代价，这就是 **LQG 问题**。
 
-最直接的想法：把构型空间固定离散化成像素一样的格子。但正如开头所说，这会导致**组合爆炸**。
+**分离原理（Separation Principle）** ：先设计观测器（状态估计器），然后使用状态反馈。著名的是，**这种方法在线性高斯系统的二次调节目标下实际上是最优的**——这就是"分离原理"。
 
-更重要的是：**固定离散化会牺牲完备性**。想象构型空间里有一条**狭窄走廊**——如果格子太粗，这条走廊可能被完全错过，明明存在路径却找不到。
+**但教材郑重警告** ：**"But it is certainly not optimal in general!"** 在一般情况下，分离原理**绝不是最优的**！
 
-### 3.2 分辨率完备 vs 概率完备
+### 5.2 LQG 的两个 Riccati 方程
 
-- **分辨率完备（Resolution Complete）**：随着离散化越来越细，算法保证完备 
-- **概率完备（Probabilistically Complete）**：随着采样点趋于无穷，找到路径的概率趋于1 
+LQG 的解需要解**两个 Riccati 方程** ：
+1. **控制 Riccati 方程**：来自 LQR 部分
+2. **估计 Riccati 方程**：来自 Kalman 滤波器部分
 
-PRM 属于后者。
+### 5.3 迭代 LQG 轨迹优化
 
-### 3.3 PRM 算法：两步法
+教材提到"Trajectory optimization with Iterative LQG"——这是 iLQG/iLQR 算法，用于在非线性系统中做轨迹优化。
 
-PRM 是一个**两阶段**算法 ：
+### 5.4 本节 PDF 标注
 
-**第一阶段：离线建图（Learning the Map）**
-1. 在构型空间中**均匀随机采样** N 个点
-2. **拒绝采样**：丢掉撞墙的点，保留自由空间中的点作为"路标"（milestone）
-3. 对每个路标，找它的 k 近邻
-4. 尝试用**直线**连接路标对，如果直线路径无碰撞，则在图中加一条边
-5. 重复直到建好"路线图"
-
-**第二阶段：在线查询（Query）**
-1. 把起点和终点连接到路线图（用同样的方法）
-2. 在图上跑 A* 找路径
-3. 返回路径
-
-### 3.4 PRM 的概率完备性
-
-教材明确指出 ：PRM 是**概率完备**的——随着样本数量趋于无穷，找到路径的概率趋于1。
-
-直觉理解：
-- 如果存在一条"ε-清晰"的路径（路径上每一点距离障碍物至少 ε）
-- 那么我们可以用一串半径为 ε/2 的球覆盖这条路径
-- 随着采样点 N 增加，每个球里至少有一个采样点的概率趋近1
-- 因此，整条路径被采样点覆盖的概率趋近1 
-- 一旦路径被覆盖，直线连接这些采样点就能重构出可行路径
-
-### 3.5 PRM 的实战表现
-
-教材诚实评价 ：
-> PRM 是个简单的想法，但在实践中出奇地有效——至少在**10维以内**是这样。
-
-**计算瓶颈**：
-- 最近邻查询（Nearest Neighbor Queries）
-- 碰撞检测查询（Collision Detection Queries）
-- 边检查：通常在边上密集采样点，逐个做碰撞检测 
-
-TRI（Toyota Research Institute）在 Drake 中有优化实现，计划开源 。
-
-### 3.6 一个发人深省的例子
-
-教材抛出一个例子 ：**"用 PRM 来 swing-up 一个单摆效果会怎样？"**
-
-这个问题留给读者思考——但暗示了：PRM 是为**纯运动学规划**（不考虑速度、加速度）设计的。如果要考虑动力学（单摆的 swing-up 需要满足能量约束），PRM 就不直接适用了。这正是下一节 RRT 要解决的问题。
-
-### 3.7 如何得到平滑轨迹
-
-即使是运动学规划，我们可能也希望路径**连续可微**（以满足速度、加速度限制）。
-
-教材提到两种处理方式 ：
-1. **PRM 输出后处理（Post-processing）**
-2. **用 GCS 做运动学轨迹优化**（利用采样生成区域）
+**注意**：15.4.1 LQG 和 15.4.2 迭代 LQG 在 PDF 中仅列标题 。详细内容需要参考其他资源。
 
 ---
 
-## 🌳 四、快速扩展随机树（RRT）：为动力学系统量身定制
+## 👁️🗨️ 六、15.5 基于观测器的反馈
 
-### 4.1 从"建图"到"长树"
+### 6.1 观测器-反馈范式的统治地位
 
-PRM 是**多查询**算法——建一次图，回答多次查询。但很多场景是**单查询**的：从特定起点到特定终点，只规划一次。
+教材指出 ：既然我们非常擅长设计全状态反馈控制器，那么最自然（且占主导地位）的方法之一就是：**先设计观测器（状态估计器），然后使用状态反馈**。
 
-而且 PRM 不考虑动力学——两点之间用直线连接，但机器人（比如汽车）不能横着走，必须沿动力学可行的轨迹移动。
+### 6.2 Luenberger 观测器
 
-**RRT 应运而生**。
+对于确定性系统，使用 **Luenberger 观测器** ：
 
-### 4.2 RRT 的基本算法
+$$\hat{x}[n+1] = A\hat{x}[n] + Bu[n] + L(y[n] - C\hat{x}[n])$$
 
-教材给出 Example 12.2（Planning with a Random Tree）：
+其中 L 是观测器增益，通过"校正项" $L(y - C\hat{x})$ 来修正估计值。
 
-```
-初始化树：T ← {x₀}  # 从起点开始
+### 6.3 卡尔曼滤波器
 
-每次迭代：
-    1. 从树 T 中随机选一个节点 x_rand
-    2. 从可行动作分布中随机选一个动作 u_rand
-    3. 计算动力学：x_new = f(x_rand, u_rand)
-    4. 如果 x_new ∈ 目标区域 G：终止！找到解了！
-    5. 否则：把新节点加入树，T ← x_new
-```
+对于随机系统，使用 **Kalman 滤波器**——这是 LQG 中的最优估计器。
 
-**核心思想**：从起点开始，**用动力学方程一步步"长"出一棵树**，树上的每个节点都代表一个**动力学可行**的状态。
+### 6.4 分离原理的微妙之处
 
-### 4.3 RRT 是概率完备的——但效率很低
+虽然 LQG 在线性高斯下是最优的，但**分离原理在一般情况下不成立**。这意味着：
+- 在某些非线性/非高斯场景下
+- **先估计状态、再做状态反馈**可能**不是最优的**
+- 必须直接优化输出反馈策略
 
-教材明确指出 ：上述算法是**概率完备**的——采样无限多时，找到路径的概率为1。
+> ⚠️ **工程启示**：LQG + Kalman 滤波器是线性高斯系统的"银弹"，但遇到非线性、非高斯、强约束时，必须考虑更一般的输出反馈优化方法。
 
-但是！**没有强启发式引导节点扩展，效率极低**。
+### 6.5 本节 PDF 标注
 
-### 4.4 一个令人警醒的例子
-
-教材给出了一个**简单的反例** ：
-- 系统：`x[n] = u[n]`，其中 `x ∈ ℝ²`，`u_i ∈ [-1, 1]`
-- 起点：原点
-- 目标区域：∀i, 15 ≤ x_i ≤ 20
-
-**结果**：扩展1000个节点后，树基本上是一团**挤在原点附近的乱点**：
-
-（教材配图显示了节点全挤在起点附近，离目标区域很远）
-
-> ⚠️ **关键洞察**：这个"稻草人"算法虽然是概率完备的，但**效率极低**——即使对这个特别简单的问题也是如此。
-
-为什么会这样？因为随机选择树节点和随机动作，大多数情况下新节点都落在**已经探索过的区域附近**，导致树**不能有效扩散**到整个空间。
-
-### 4.5 RRT 的核心难题
-
-教材总结 ：
-> 生成可行点树的想法有明显优势，但似乎我们**失去了标记"某区域已被充分探索"的能力**。要让随机算法有效，我们至少需要某种**启发式来鼓励节点扩散、探索空间**。
-
-这就是 RRT 后续各种变种要解决的问题。
-
-### 4.6 RRT 与 PRM 的本质区别
-
-| 特性 | PRM | RRT |
-|---|---|---|
-| 数据结构 | 图（Graph） | 树（Tree） |
-| 适用场景 | 多查询 | 单查询 |
-| 动力学 | 不考虑（直线运动） | 考虑（动力学积分）|
-| 探索方式 | 均匀采样全空间 | 从起点向外生长 |
-| 完备性 | 概率完备 | 概率完备 |
+**注意**：15.5.1 Luenberger 观测器在 PDF 中仅列标题 。详细内容需要参考标准控制教科书。
 
 ---
 
-## 🚀 五、RRT 的变种与扩展
+## 🌊 七、15.6 基于扰动的反馈
 
-教材列出了丰富的变种 ，我按重要性梳理：
+### 7.1 绕过"双线性陷阱"的新思路
 
-### 5.1 RRT*：渐近最优的 RRT
+教材介绍了一种有趣的替代方案 ：**不试图观测/估计系统的真实状态**，而是用**基于扰动的参数化**来处理输出反馈。
 
-普通的 RRT 只保证找到**一条**可行路径，但不保证是最优的。RRT* 通过两个关键改进实现了**渐近最优性**：
+这是在随机/鲁棒 MPC 中介绍的"扰动反馈"概念的扩展。
 
-**改进一：选父节点（Choose Parent）**
-当加入新节点 `x_new` 时，不是简单地连到最近邻，而是在 `x_new` 附近的一个**球**内，选取能使"从起点到 x_new 的总代价"最小的节点作为父节点。
+### 7.2 系统模型
 
-**改进二：重连（Rewire）**
-加入 `x_new` 后，检查 `x_new` 附近的所有节点 `x_near`——如果通过 `x_new` 连接到 `x_near` 能得到更小的代价，就**重新连接** `x_near` 的父节点为 `x_new`。
+$$\begin{align*}x[n+1]&=A x[n]+B u[n]+w[n],\\ y[n]&=C x[n]+v[n],\end{align*}$$
 
-**理论保证** ：RRT* 是**概率完备**且**渐近最优**的——随着样本数 N→∞，树中最佳路径的代价几乎必然收敛到全局最优代价 c*。
+### 7.3 输出反馈策略的参数化
 
-**连接半径的选择**：
-$$r_n = \gamma \left( \frac{\log n}{n} \right)^{1/d}$$
-其中 n 是当前节点数，d 是构型空间的维度。这个半径**随节点数增加而缩小** 。
+$$u[n]=K_{0}[n]y[0]+\sum_{i=1}^{n-1} K_{i}[n]e[n-i]$$
 
-### 5.2 其他重要变种
+其中 $e[n]$ 是**创新过程（innovation）**——即"实际观察与预测观察的差异" 。
 
-教材提到的变种 ：
-- **RRT-sharp**：加速 RRT* 的收敛
-- **RRTx**：适用于动态环境
-- **Kinodynamic-RRT***：处理带动力学约束的系统
-- **LQR-RRT(*)** ：用 LQR 进行局部连接，特别适合复杂动力学
+### 7.4 为什么这个参数化强大？
 
-### 5.3 复杂度界限与离散度限制
+这个参数化**在某些情况下可以导致输出反馈目标的凸公式**！这是与第13章"扰动反馈参数化"的直接延续——把 Youla 参数化的思想应用到输出反馈场景。
 
-教材提到"Complexity bounds and dispersion limits"——这是 RRT* 理论分析的前沿课题，涉及：
-- 树的**离散度（dispersion）**：树节点在空间中的均匀分布程度
-- 收敛速度的**复杂度界限**
+**关键优势**：
+- 闭环状态在控制参数 K 中是**凸的**
+- 可以使用凸优化同时搜索所有 K_i
+- 避免了静态输出反馈的 NP-hard 困境
 
-> 📌 **这部分教材仅列出标题**，详细内容需要参考 Karaman & Frazzoli 2011 的原始论文等文献。
+### 7.5 本节 PDF 标注
+
+**注意**：e[n] 的具体定义和详细推导在 PDF 中被截断 。完整内容需要参考 Sadraddini & Tedrake 2020 的论文 。
 
 ---
 
-## 🧩 六、分解方法（Decomposition Methods）
+## 🔧 八、15.7 优化动态策略
 
-教材简要提到 ：
+### 8.1 四种优化途径
 
-### 6.1 单元分解（Cell Decomposition）
-将自由空间划分为简单的单元（如矩形、单纯形），在每个单元内规划路径。
+教材列出了优化动态输出反馈策略的四种主要方法 ：
 
-### 6.2 近似分解（如 IRIS）
-对于复杂环境，使用**近似分解**方法。IRIS（Iterative Regional Inflation by Semidefinite programming）是一个重要算法——它用凸优化找到**最大无碰撞凸区域**。
+### 8.2 H₂、H∞ 和 LQG 的凸重新参数化
 
-> 📌 **这部分教材仅列出标题**，详细内容需要参考 IRIS 的原始论文（Deits & Tedrake 2015）。
+**DGKF 方法**（Doyle-Glover-Khargonekar-Francis）：通过解**两个 Riccati 方程**来实现 LQG 控制 。
+
+**Scherer 的凸重新参数化**：Scherer & Weiland 给出了 LQG 的凸重新参数化框架 ，允许用凸优化直接搜索动态输出反馈控制器。
+
+### 8.3 LQG 的策略梯度
+
+用策略梯度方法（第11章）直接优化 LQG 控制器参数 。
+
+### 8.4 SOS 交替优化
+
+**Coming soon** 。参见 Chou & Tedrake 2023 的工作 ：用平方和（SOS）优化合成非线性系统的稳定降阶视觉运动策略。
+
+### 8.5 教师-学生学习
+
+如 Marco Hutter、Pulkit Agrawal 等人的工作 ：
+- **教师**：在全状态反馈上训练的策略（容易训练）
+- **学生**：从像素/传感器直接输出控制的策略（部署用）
+- **蒸馏**：用 imitation learning 把教师策略压缩到学生策略
+
+这是当前机器人学习中的主流范式之一。
+
+### 8.6 本节 PDF 标注
+
+**注意**：
+- 15.7.1 凸重新参数化：列出了 DGKF 和 Scherer 的框架 
+- 15.7.2 LQG 策略梯度：仅列标题 
+- 15.7.3 SOS 交替：标注 "Coming soon" 
+- 15.7.4 教师-学生学习：仅列标题 
 
 ---
 
-## 💻 七、代码实践重点补充说明（这是本章最该动手的部分）
+## 📸 九、15.8 从像素反馈
 
-教材配套的 Exercise 12.1 要求 ：
-> "在这个 notebook 里，我们将编写快速扩展随机树（RRT）的代码。基于此实现，我们还将实现 RRT*——一种收敛到最优解的 RRT 变种。"
+### 9.1 过去十年最重要的进展
 
-### 实验一：实现基础 RRT
+教材明确指出 ：
+> "In my opinion, one of the most important advances in control in the last decade has been the introduction of high-rate feedback from cameras."
 
-**核心步骤**：
+**摄像头的高速率反馈是过去十年控制领域最重要的进展之一**，这场革命由深度学习的计算机视觉突破所推动。在机器人操作领域，这种反馈的价值是不可否认的。
+
+### 9.2 传统方法的困境
+
+但摄像头也打破了我们之前讨论的许多综合工具 ：
+- **维度极高**：RGB 图像是百万维的
+- **非平滑**：图像空间是"horrible and non-smooth"的
+- **模型缺失**：我们没有一个好的"像素动力学模型"
+
+教材诚实地说 ：
+> "As of this writing, conventional wisdom is that model-based control does not have a lot to offer to this problem-- to design control from cameras, we are often limited to either imitation learning or black-box reinforcement learning."
+
+**当前的主流做法**：
+- **模仿学习**（如 Diffusion Policy ）
+- **黑盒强化学习**（如 Levine、Finn、Zhao 等人的工作 ）
+- **教师-学生蒸馏**（如 Miki et al. 的四足机器人感知运动学习 ）
+
+### 9.3 教材作者的研究愿景
+
+教材作者（Russ Tedrake）认为 ：
+> "I personally think that we have thrown the baby out with the bathwater, and consider a highly important research area to close this gap."
+
+**"把孩子和洗澡水一起倒掉了"**——作者认为我们过于激进地抛弃了基于模型的控制方法，而这是填补"像素到力矩"鸿沟的重要研究方向。
+
+### 9.4 本节 PDF 标注
+
+**注意**：15.8 反馈从像素在 PDF 中标注 "More coming soon..." 。这是当前最活跃的研究前沿。
+
+---
+
+## 💻 十、代码实践重点补充说明（这是本章最该动手的部分）
+
+虽然 PDF 中许多小节仅列标题，但基于教材给出的框架，我可以梳理出以下关键的实践路径：
+
+### 实验一：静态输出反馈的 NP-hard 演示
+
+**目的**：亲身体验稳定增益集合的"断开性"。
+
 ```python
-def rrt(start, goal, c_space_bounds, max_iter=10000, step_size=0.1):
-    tree = {tuple(start): None}  # node -> parent
-    nodes = [start]
-    
-    for _ in range(max_iter):
-        # 1. 采样随机配置
-        if np.random.rand() < goal_bias:  # 目标偏置
-            random_q = goal
-        else:
-            random_q = np.random.uniform(bounds[:, 0], bounds[:, 1])
-        
-        # 2. 找最近节点
-        distances = np.linalg.norm(nodes - random_q, axis=1)
-        nearest_idx = np.argmin(distances)
-        nearest = nodes[nearest_idx]
-        
-        # 3. 向随机点延伸一步
-        direction = random_q - nearest
-        distance = np.linalg.norm(direction)
-        if distance > step_size:
-            new_q = nearest + direction / distance * step_size
-        else:
-            new_q = random_q
-        
-        # 4. 碰撞检测
-        if is_collision_free_edge(nearest, new_q):
-            tree[tuple(new_q)] = tuple(nearest)
-            nodes.append(new_q)
-            
-            # 5. 检查是否到达目标
-            if np.linalg.norm(new_q - goal) < step_size:
-                if is_collision_free_edge(new_q, goal):
-                    tree[tuple(goal)] = tuple(new_q)
-                    return reconstruct_path(tree, goal)
-    
-    return None  # 失败
-```
+import numpy as np
+import matplotlib.pyplot as plt
 
-**关键参数**：
-- **步长（step_size）**：太小则树生长慢；太大则边经常撞墙被拒
-- **目标偏置（goal_bias）**：5-10% 的概率直接采样目标点，大幅加速收敛
-- **碰撞检测**：调用 FCL 或自定义简单碰撞检测器
+# Megretski 的例子
+A = np.array([[0, 0, 2],
+              [1, 0, 0],
+              [0, 1, 0]], dtype=float)
+B = np.array([[1], [0], [0]], dtype=float)
+C = np.array([[1, 1, 3]], dtype=float)
 
-### 实验二：实现 RRT*
+# 扫描 k 值
+k_values = np.linspace(-10, 10, 2000)
+max_real_eigs = []
 
-**在 RRT 基础上增加两个关键步骤**：
+for k in k_values:
+    # 闭环系统矩阵: A - B*K*C
+    K = np.array([[k]])
+    A_cl = A - B @ K @ C
+    eigvals = np.linalg.eigvals(A_cl)
+    max_real_eigs.append(np.max(eigvals.real))
 
-```python
-def rrt_star(start, goal, c_space_bounds, max_iter=10000, step_size=0.1):
-    tree = {tuple(start): None}
-    nodes = [start]
-    costs = {tuple(start): 0.0}  # 从起点到节点的代价
-    
-    for n in range(max_iter):
-        # 采样、找最近邻、延伸（同 RRT）
-        # ...
-        
-        # === RRT* 改进一：选父节点 ===
-        # 计算连接半径
-        r = gamma * (np.log(n+1) / (n+1)) ** (1/d)
-        # 找 r 邻域内的所有节点
-        near_nodes = [node for node in nodes 
-                     if np.linalg.norm(node - new_q) < r]
-        
-        # 选使总代价最小的父节点
-        best_parent = nearest
-        min_cost = costs[tuple(nearest)] + edge_cost(nearest, new_q)
-        for node in near_nodes:
-            cost = costs[tuple(node)] + edge_cost(node, new_q)
-            if cost < min_cost and is_collision_free_edge(node, new_q):
-                best_parent = node
-                min_cost = cost
-        
-        # 加入树
-        tree[tuple(new_q)] = tuple(best_parent)
-        nodes.append(new_q)
-        costs[tuple(new_q)] = min_cost
-        
-        # === RRT* 改进二：重连 ===
-        for node in near_nodes:
-            new_cost = min_cost + edge_cost(new_q, node)
-            if new_cost < costs[tuple(node)] and is_collision_free_edge(new_q, node):
-                tree[tuple(node)] = tuple(new_q)
-                costs[tuple(node)] = new_cost
+# 绘制最大实部特征值
+plt.figure(figsize=(10, 4))
+plt.plot(k_values, max_real_eigs, 'b-', linewidth=2)
+plt.axhline(y=0, color='r', linestyle='--', label='Stability boundary')
+plt.xlabel('k (static output feedback gain)')
+plt.ylabel('max Re(eigenvalue)')
+plt.title('Static Output Feedback: Stability is Non-Convex!')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# 找出稳定区域
+stable_regions = []
+in_stable = False
+start_k = 0
+for i, (k, val) in enumerate(zip(k_values, max_real_eigs)):
+    if val < 0 and not in_stable:
+        in_stable = True
+        start_k = k
+    elif val >= 0 and in_stable:
+        in_stable = False
+        stable_regions.append((start_k, k))
+
+print("Stable regions of k (where max Re(eig) < 0):")
+for region in stable_regions:
+    print(f"  k ∈ [{region[0]:.3f}, {region[1]:.3f}]")
 ```
 
 **预期现象**：
-- 普通 RRT：找到第一条路径就停，路径质量差（锯齿状）
-- RRT*：持续运行，路径**不断改进**，代价逐渐收敛到最优
+- 你会看到稳定区域是**多个断开的区间**
+- 这直观地证明了"稳定增益集合是非凸且不连通的"
+- 验证了 Blondel & Tsitsiklis 的 NP-hard 结论
 
-### 实验三：可视化与对比
+### 实验二：POMDP 奶酪迷宫的信念状态
 
-**动手要点**：
-1. 在2D环境中（如带有圆形/多边形障碍物的平面）运行 RRT 和 RRT*
-2. 画出树生长过程动画
-3. 对比路径长度：RRT* 的路径长度应**单调下降**并收敛
-4. 观察"重连"操作如何优化树结构
+**目的**：实现奶酪迷宫的信念更新，找出那 7 个信念状态。
 
-### 实验四：带动力学的 RRT（Kinodynamic RRT）
+```python
+import numpy as np
 
-**关键修改**：
-- 用**动力学方程积分**代替直线连接
-- 最近邻搜索用**代价启发式**代替欧氏距离
-- 特别适合无人机、汽车等非完整约束系统
+# 迷宫布局（5x3 网格，但中间有墙）
+# 用坐标 (row, col) 表示位置
+# 观察标签映射
+maze_layout = {
+    (0,0): 1, (0,1): 2, (0,2): 3, (0,3): 2, (0,4): 4,
+    (1,0): 5,                    (1,2): 5,           (1,4): 5,
+    (2,0): 6, (2,1): 7, (2,2): 6
+}
+goal_state = (2, 1)  # 阴影区域
 
-**LQR-RRT* 的核心思想**：
-- 局部连接用 LQR 反馈控制器
-- 保证连接的动力学可行性
-- 特别适合复杂动力学/欠驱动系统
+# 初始信念：均匀分布在所有可达位置
+all_positions = list(maze_layout.keys())
+n_states = len(all_positions)
+initial_belief = np.ones(n_states) / n_states
 
-### 实验五：PRM 的实现与对比
+# 动作：上、下、左、右
+actions = ['up', 'down', 'left', 'right']
 
-**动手要点**：
-1. 实现两阶段 PRM：离线建图 + 在线查询
-2. 对比 RRT 和 PRM 在同一环境中的表现
-3. 观察：PRM 在**多查询**场景下更高效；RRT 在**单查询**场景下更高效
+def get_observation(pos):
+    return maze_layout[pos]
+
+def transition_model(pos, action):
+    """确定性转移（如果撞墙则停留）"""
+    row, col = pos
+    moves = {'up': (-1,0), 'down': (1,0), 'left': (0,-1), 'right': (0,1)}
+    dr, dc = moves[action]
+    new_row, new_col = row+dr, col+dc
+    new_pos = (new_row, new_col)
+    if new_pos in maze_layout:
+        return new_pos
+    return pos  # 撞墙，停留
+
+def update_belief(belief, action, observation):
+    """贝叶斯信念更新"""
+    new_belief = np.zeros_like(belief)
+    for i, pos in enumerate(all_positions):
+        # 预测：如果执行 action，会从哪个状态转移到 pos？
+        # 由于转移是确定性的，反向查找
+        for prev_pos in all_positions:
+            if transition_model(prev_pos, action) == pos:
+                # 观察概率：p(o|s)
+                if get_observation(pos) == observation:
+                    new_belief[i] += belief[all_positions.index(prev_pos)]
+    # 归一化
+    if new_belief.sum() > 0:
+        new_belief /= new_belief.sum()
+    return new_belief
+
+# 模拟：从初始观察=5 开始
+print("Initial observation is 5")
+current_belief = initial_belief.copy()
+# 筛选观察=5 的可能位置
+valid_positions = [p for p in all_positions if get_observation(p) == 5]
+mask = np.array([p in valid_positions for p in all_positions])
+current_belief = current_belief * mask
+current_belief /= current_belief.sum()
+
+print("After observing 5, belief is:")
+for i, pos in enumerate(all_positions):
+    if current_belief[i] > 0:
+        print(f"  Position {pos}: {current_belief[i]:.3f}")
+
+# 继续：执行动作 'down'，观察结果
+action = 'down'
+# 假设实际观察到了某个标签
+actual_obs = 6  # 假设向下移动到观察6的位置
+current_belief = update_belief(current_belief, action, actual_obs)
+print(f"\nAfter action '{action}' and observing {actual_obs}:")
+for i, pos in enumerate(all_positions):
+    if current_belief[i] > 0:
+        print(f"  Position {pos}: {current_belief[i]:.3f}")
+```
+
+**预期现象**：
+- 初始观察=5 时，机器人可能在三个位置：(1,0), (1,2), (1,4)
+- 随着动作和观察的积累，信念会逐渐集中
+- **最优策略确实只需要 7 个信念状态**——这是 POMDP 信念空间压缩的典型例子
+
+### 实验三：Luenberger 观测器设计
+
+**目的**：实现一个简单的 Luenberger 观测器。
+
+```python
+import numpy as np
+
+# 倒立摆线性化模型（在直立位置附近）
+A = np.array([[0, 1],
+              [10, -0.1]])  # 简化的 A 矩阵
+B = np.array([[0], [1]])
+C = np.array([[1, 0]])  # 只能测量位置，不能测量速度
+
+# 设计观测器增益 L
+# 目标：A - LC 的特征值在左半平面
+# 使用极点配置
+desired_poles = [-5, -6]  # 观测器收敛速度比控制器快
+
+# 计算 L（使用 Ackermann 公式或 place 函数）
+# 这里简化：直接给出 L
+L = np.array([[5], [10]])  # 手动选择的增益
+
+def luenberger_observer(x_hat, u, y, dt=0.01):
+    """Luenberger 观测器的一步更新"""
+    x_hat_dot = A @ x_hat + B @ u + L @ (y - C @ x_hat)
+    return x_hat + dt * x_hat_dot
+
+# 仿真：真实系统 vs 观测器
+np.random.seed(42)
+x_true = np.array([[0.1], [0.2]])  # 初始真实状态
+x_hat = np.array([[0.0], [0.0]])   # 初始估计（错误）
+
+dt = 0.01
+for t in range(500):  # 5秒仿真
+    u = np.array([[0.0]])  # 零控制（仅为演示观测器）
+    # 真实系统
+    x_true = x_true + dt * (A @ x_true + B @ u)
+    # 测量（有噪声）
+    y = C @ x_true + np.random.randn(1, 1) * 0.01
+    # 观测器更新
+    x_hat = luenberger_observer(x_hat, u, y, dt)
+    
+    if t % 100 == 0:
+        print(f"t={t*dt:.1f}s: True state = [{x_true[0,0]:.3f}, {x_true[1,0]:.3f}], "
+              f"Estimated = [{x_hat[0,0]:.3f}, {x_hat[1,0]:.3f}]")
+```
+
+**预期现象**：
+- 观测器估计的状态会快速收敛到真实状态
+- 即使初始估计完全错误，观测器也能在几百毫秒内纠正
+- **验证了分离原理**：观测器和控制器可以独立设计
+
+### 实验四：扰动反馈参数化
+
+**目的**：实现基于扰动的输出反馈参数化。
+
+```python
+import numpy as np
+
+# 线性系统
+A = np.array([[0.9, 0.1],
+              [0.0, 0.95]])
+B = np.array([[0.1], [0.1]])
+C = np.array([[1, 0]])  # 只能测量第一个状态
+
+# 扰动反馈参数化：u[n] = K0*y[0] + Σ_{i=1}^{n-1} Ki*e[n-i]
+# 其中 e[n] 是创新过程
+
+# 简化：使用 FIR 截断（长度为 L）
+L = 5
+K0 = np.random.randn(1, 1) * 0.1
+K_history = [np.random.randn(1, 1) * 0.1 for _ in range(L)]
+
+# 维护创新历史
+e_history = []
+
+def compute_control(y_current, e_history):
+    """计算控制输入"""
+    u = K0 @ y_current
+    for i in range(min(len(e_history), L)):
+        u += K_history[i] @ e_history[-(i+1)]
+    return u
+
+def compute_innovation(y, C, x_hat):
+    """计算创新 e[n] = y[n] - C*x_hat[n]"""
+    predicted_y = C @ x_hat
+    return y - predicted_y
+
+# 仿真
+x = np.array([[1.0], [0.5]])
+x_hat = np.array([[0.0], [0.0]])
+e_history = []
+
+for t in range(100):
+    # 测量
+    y = C @ x + np.random.randn(1, 1) * 0.05
+    
+    # 计算创新
+    e = compute_innovation(y, C, x_hat)
+    e_history.append(e)
+    
+    # 计算控制
+    u = compute_control(y, e_history)
+    
+    # 系统演化
+    w = np.random.randn(2, 1) * 0.01
+    x = A @ x + B @ u + w
+    
+    # 简单观测器更新（简化版）
+    x_hat = A @ x_hat + B @ u + 0.5 * (y - C @ x_hat)
+```
+
+**预期现象**：
+- 扰动反馈参数化允许我们用凸优化搜索 K0 和 K_history
+- 这避免了静态输出反馈的 NP-hard 问题
+- 是输出反馈优化的实用方法
+
+### 实验五：LQG 控制的完整实现
+
+**目的**：实现 LQG 控制器（LQR + Kalman 滤波器）。
+
+```python
+import numpy as np
+from scipy.linalg import solve_continuous_riccati
+
+# 系统参数
+A = np.array([[0, 1],
+              [0, -0.1]])
+B = np.array([[0], [1]])
+C = np.array([[1, 0]])
+Q = np.diag([10, 1])  # 状态代价
+R = np.array([[1]])   # 控制代价
+# 噪声协方差
+W = np.eye(2) * 0.01  # 过程噪声
+V = np.eye(1) * 0.05  # 测量噪声
+
+# 1. 解控制 Riccati 方程得到 LQR 增益
+S = solve_continuous_riccati(A, B, Q, R)
+K = np.linalg.inv(R) @ B.T @ S
+
+# 2. 解估计 Riccati 方程得到 Kalman 滤波器增益
+# 对偶系统：A^T, C^T
+P = solve_continuous_riccati(A.T, C.T, W, V)
+L = P @ C.T @ np.linalg.inv(V)
+
+# 3. LQG 控制器
+def lqg_controller(x_hat, y):
+    """LQG 控制律：u = -K*x_hat"""
+    u = -K @ x_hat
+    # 更新估计
+    x_hat_dot = A @ x_hat + B @ u + L @ (y - C @ x_hat)
+    return u, x_hat_dot
+
+# 仿真
+x = np.array([[0.5], [0.0]])  # 初始状态
+x_hat = np.array([[0.0], [0.0]])  # 初始估计
+dt = 0.01
+
+for t in range(300):  # 3秒
+    # 测量
+    y = C @ x + np.random.randn(1, 1) * np.sqrt(V[0,0])
+    
+    # LQG 控制
+    u, x_hat_dot = lqg_controller(x_hat, y)
+    x_hat = x_hat + dt * x_hat_dot
+    
+    # 真实系统演化
+    w = np.random.randn(2, 1) * np.sqrt(W[0,0])
+    x = x + dt * (A @ x + B @ u) + np.sqrt(dt) * w
+    
+    if t % 50 == 0:
+        cost = x.T @ Q @ x + u.T @ R @ u
+        print(f"t={t*dt:.1f}s: State=[{x[0,0]:.3f}, {x[1,0]:.3f}], "
+              f"Est=[{x_hat[0,0]:.3f}, {x_hat[1,0]:.3f}], "
+              f"Instantaneous cost={cost[0,0]:.3f}")
+```
+
+**预期现象**：
+- LQG 控制器能稳定系统，即使有过程和测量噪声
+- 状态估计 x_hat 快速收敛到真实状态 x
+- **验证了分离原理**：LQR 和 Kalman 滤波器独立设计，组合后最优
+
+### 实验六：教师-学生蒸馏（概念验证）
+
+**目的**：体验用模仿学习将"全状态教师"蒸馏为"像素学生"。
+
+```python
+import numpy as np
+
+# 简化示例：状态空间维度 = 4，像素空间维度 = 100
+state_dim = 4
+pixel_dim = 100
+action_dim = 2
+
+# 教师策略：π_teacher(x) -> u（全状态反馈）
+def teacher_policy(x):
+    """假设教师是 LQR 策略"""
+    K_teacher = np.random.randn(action_dim, state_dim) * 0.5
+    return K_teacher @ x
+
+# 学生策略：π_student(pixels) -> u（神经网络）
+class StudentPolicy:
+    def __init__(self):
+        # 简单的线性映射（实际应用中是深度神经网络）
+        self.W = np.random.randn(action_dim, pixel_dim) * 0.01
+    
+    def __call__(self, pixels):
+        return self.W @ pixels
+
+# 生成训练数据：通过"渲染"函数将状态映射到像素
+def render(x):
+    """将状态渲染为像素（简化：线性投影 + 噪声）"""
+    projection = np.random.randn(pixel_dim, state_dim)
+    pixels = projection @ x + np.random.randn(pixel_dim) * 0.1
+    return pixels
+
+# 训练：模仿学习
+student = StudentPolicy()
+learning_rate = 0.001
+n_epochs = 1000
+
+for epoch in range(n_epochs):
+    # 随机采样状态
+    x = np.random.randn(state_dim)
+    pixels = render(x)
+    
+    # 教师动作
+    u_teacher = teacher_policy(x)
+    
+    # 学生动作
+    u_student = student(pixels)
+    
+    # 模仿学习损失：MSE
+    loss = np.mean((u_teacher - u_student)**2)
+    
+    # 梯度下降（解析梯度）
+    gradient = -2 * (u_teacher - u_student) @ pixels.T
+    student.W -= learning_rate * gradient
+    
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch}: Loss = {loss:.6f}")
+```
+
+**预期现象**：
+- 学生的动作逐渐接近教师的动作
+- 这是"教师-学生"范式的核心思想
+- 在实际应用中，学生是深度神经网络，教师是全状态反馈控制器
+
+### 实验七：Diffusion Policy（概念验证）
+
+**目的**：理解现代的 visuomotor 策略学习方法。
+
+参考 Chi et al. 2024 的 Diffusion Policy ：
+- 输入：视觉观察（像素）
+- 输出：动作序列
+- 方法：扩散模型（denoising diffusion probabilistic models）
+
+```python
+# 概念性伪代码
+"""
+1. 收集专家演示数据：(observation, action_sequence)
+2. 训练扩散模型：
+   - 前向过程：向动作序列添加噪声
+   - 反向过程：神经网络预测噪声
+3. 推理时：
+   - 从高斯噪声开始
+   - 迭代去噪得到动作序列
+   - 执行第一个动作，重新观察，重复
+"""
+
+# 关键洞察：Diffusion Policy 直接从像素学习动作分布
+# 不需要显式的状态估计
+# 这是当前机器人操作的主流方法之一
+```
 
 ---
 
-## 📋 八、与 PDF 原文的逐项对照核查
-
-为确保不遗漏原文任何重要内容，我逐节对照：
+## 📋 十一、与 PDF 原文的逐项对照核查
 
 | PDF 章节 | 我的讲解覆盖情况 | 补充说明 |
 |---|---|---|
-| 章节开篇动机 | ✅ 完整讲解 | 几何复杂/非凸优化地形；采样方法的必要性 |
-| 12.1 大规模增量搜索 | ✅ 完整讲解 | AI 历史背景；A* 算法；可采纳启发式 |
-| 离散 A* 算法（Algorithm 12.1）| ✅ 完整讲解 | g/h/f 的定义；可采纳启发式性质 |
-| A* 的关键性质 | ✅ 完整讲解 | 不展开 f̃(p) > f(v_s) 的路径；完备且最优 |
-| 完备性与最优性定义 | ✅ 完整讲解 | completeness & optimality of A* |
-| Fast Downward 等启发式 | ✅ 提到 | 因子分解等高级启发式 |
-| AlphaGo/AlphaZero 与 LLM+规划 | ✅ 完整讲解 | 规划在现代 AI 中的延续 |
-| 12.2 概率路线图（PRM）| ✅ 完整讲解 | 分辨率完备 vs 概率完备 |
-| PRM 两阶段算法 | ✅ 完整讲解 | 离线建图 + 在线查询 |
-| PRM 的概率完备性 | ✅ 完整讲解 | 采样趋于无穷时找到路径 |
-| PRM 的实战表现与瓶颈 | ✅ 完整讲解 | 10维以内有效；最近邻与碰撞检测瓶颈 |
-| Example 12.1（PRM swing-up 单摆）| ✅ 提到 | 教材留作思考题 |
-| 获取平滑轨迹 | ✅ 提到 | PRM 后处理；GCS 运动学轨迹优化 |
-| 12.3 快速扩展随机树（RRTs）| ✅ 完整讲解 | Example 12.2 随机树算法 |
-| RRT 的概率完备性 | ✅ 完整讲解 | 但效率极低 |
-| RRT 的低效反例 | ✅ 完整讲解 | x[n]=u[n] 系统；1000节点后仍远离目标 |
-| 12.3.1 带动力学的 RRT | ⚠️ PDF 仅列标题 | 需参考 Kinodynamic-RRT* 文献 |
-| 12.3.2 变种与扩展 | ✅ 完整讲解 | RRT*, RRT-sharp, RRTx, Kinodynamic-RRT*, LQR-RRT(*) |
-| 复杂度界限与离散度限制 | ⚠️ PDF 仅列标题 | 理论分析前沿 |
-| 12.4 分解方法 | ✅ 提到 | 单元分解；IRIS 近似分解 |
-| 12.5 练习 | ✅ 完整讲解 | Exercise 12.1：实现 RRT 和 RRT* |
-| 参考文献 [1]-[4] | ✅ 完整覆盖 | LaValle 2006；Helmert 2006；Amato & Wu 1996；Amice et al. 2024 |
-
-### 通俗性补充（针对基础薄弱读者的额外解释）
-
-1. **什么是"构型空间"（Configuration Space）？**
-   想象一个2关节机械臂：关节1的角度 θ₁ 和关节2的角度 θ₂ 构成一个2维空间，每个点 (θ₁, θ₂) 代表机械臂的一个姿态。这个2维空间就是构型空间。**机器人规划的本质，就是在这个空间里找一条从起点到终点的无碰撞路径**。
-
-2. **为什么叫"概率完备"而不是"完备"？**
-   完备 = 只要存在路径，算法**保证**能找到。
-   概率完备 = 只要存在路径，**采样足够多时点，找到的概率趋近1**——但不保证有限时间内一定找到。
-   就像买彩票：买得越多，中奖概率越趋近1，但买有限张不保证一定中。
-
-3. **A* 的"可采纳启发式"为什么不能高估？**
-   如果启发式高估了真实代价，A* 可能会**过早放弃真正的最优路径**。就像导航软件如果低估了路程，可能会建议你走一条实际上更远的路。
-
-4. **RRT 的"树"和 PRM 的"图"有什么区别？**
-   - 树：从起点开始"生长"，每个节点**只有一个父节点**——就像真实的树枝
-   - 图：在空间中随机撒点，点与点之间**可以有多条边**——就像城市的地铁网络
-
-5. **RRT* 的"重连"为什么能让路径变好？**
-   想象一棵树：最初 A 是 B 的父节点。后来长出了一个新节点 C，发现"从起点经 C 到 B"比"从起点经 A 到 B"更短——那么就**把 B 的父节点改成 C**。这样整条路径就缩短了。
-
-6. **为什么 RRT 在简单例子上效率极低？**
-   因为随机选择树节点 + 随机动作，大多数新节点落在**已探索区域附近**——树不能有效向外扩散。这就像你在一个迷宫里随机游走，大部分时间都在原地打转。
-
----
-
-## 🎁 九、整体综合：采样规划在机器人控制中的真正地位
-
-把这一章放到整个机器人控制版图里看：
-
-```
-几何复杂 / 非凸优化地形
-    ↓ 网格法组合爆炸，非线性轨迹优化易卡局部极小
-采样-based 运动规划
-    ↓
-PRM（多查询）+ RRT（单查询）
-    ↓ 升级
-RRT*（渐近最优）/ Kinodynamic-RRT*（带动力学）
-    ↓ 结合
-高层路径规划 → MPC 跟踪 → 底层控制
-```
-
-### 五个最关键的认识
-
-1. **采样 = 用概率换效率**：放弃绝对完备性，换取在高维空间中的可扩展性
-
-2. **A* 是离散图搜索的王者**：可采纳启发式保证完备且最优；启发式越强，搜索效率越高
-
-3. **PRM 适合多查询场景**：离线建图一次，在线查询多次；概率完备
-
-4. **RRT 适合单查询 + 动力学约束**：从起点"长树"，树上每个节点动力学可行；基础 RRT 概率完备但非最优
-
-5. **RRT* 实现渐近最优**：通过"选父节点"和"重连"两个操作，随着样本增加，路径代价收敛到全局最优
-
-### 对工程实践的五个启示
-
-1. **维度诅咒是真实存在的**：6维以上的规划问题，网格法不可用，采样法是唯一出路
-
-2. **RRT 必须加启发式**：纯随机 RRT 效率极低，必须引入"目标偏置"、"Voronoi 偏置"等启发式
-
-3. **RRT* 的重连半径是关键**：理论值 $r_n = \gamma(\log n / n)^{1/d}$，实践中常用固定值近似
-
-4. **动力学约束用 Kinodynamic-RRT***：边不再是直线，而是动力学方程的积分；LQR-RRT* 用 LQR 反馈保证连接可行性
-
-5. **现代规划栈的选择**：
-   - 固定环境 + 多次查询 → **PRM***
-   - 单查询 + 几何复杂 → **RRT* 或 BIT***
-   - 带动力学约束 → **Kinodynamic-RRT* 或 LQR-RRT***
-   - MoveIt + OMPL 提供了所有这些算法的工业级实现 
-
----
-
-## 🔗 十、与你前面十层机器人栈的深度结合
-
-把你前几轮的十层栈与本章内容对照：
-
-| 栈层 | 采样规划的应用 |
-|---|---|
-| **L1 关节 ADRC/PID** | 不涉及——底层控制用反馈即可 |
-| **L2 全身 WBC/MPC** | **关键结合点**：采样规划生成**参考路径**，MPC 负责**跟踪**这条路径并处理动态约束 |
-| **L3 步态/平衡** | 足式机器人的足部落点选择可用 RRT* 在地形上规划；步态切换用采样搜索 |
-| **L4 RL/技能** | 高维状态空间中的策略搜索可借鉴采样的思想；RRT 的"树生长"与 RL 的"经验回放"有异曲同工之妙 |
-| **L5 VLA/世界模型** | 世界模型预测未来 → 采样规划在预测空间里搜最优动作序列；AlphaGo 的 MCTS 就是典范 |
-| **L6 HALOS 安全层** | **障碍函数 + 采样规划**：在安全区域内采样，保证规划出的路径永不进入禁区 |
-| **L7 仿真训练** | 仿真环境中大量采样评估；Sim2Real 迁移 |
-| **L8 数据闭环** | 真实数据更新环境模型 → 重新采样规划 |
-| **L9 端侧部署** | RRT* 的实时性挑战；Orin 上常使用 RRT-Connect 或 BIT* 等加速变种 |
-| **L10 组织运营** | 把采样规划的成功率/覆盖率作为机器人部署的"性能护照" |
-
-### 三个深度洞察
-
-**洞察一**：**MPC 与采样规划是"上下游"关系**。采样规划在**高维构型空间**中生成一条几何路径（忽略精细动力学），然后 MPC 在**动力学层面**跟踪这条路径，处理速度、加速度约束。两者互补：采样规划解决"去哪里"的问题，MPC 解决"怎么去"的问题。
-
-**洞察二**：**RRT* 的渐近最优性与第11章策略搜索的 PL 条件遥相呼应**。RRT* 保证随着样本增加，路径代价收敛到全局最优；策略搜索在 LQR 特例中，PL 条件保证梯度下降收敛到全局最优 K*。**两者都通过"样本/迭代数量趋近无穷"来获得最优性保证**——这是现代机器人规划与学习的统一数学语言。
-
-**洞察三**：**HALOS 安全层与采样的深度集成**。传统采样规划只考虑几何碰撞；HALOS 安全层要求"永不进入摔倒禁区"——这相当于在构型空间中定义了**禁区**。采样时，不仅要拒绝撞墙的点，还要拒绝进入禁区的点。RRT 生长的树天然满足安全约束——这是比紧急停机更主动的安全策略。
-
----
-
-## 📌 十一、章节完整性声明
-
-需要诚实说明的是：根据提供的 PDF 内容：
-
-- **12.3.1 RRTs for robots with dynamics** 在 PDF 中仅列了标题 
-- **Complexity bounds and dispersion limits** 在 PDF 中仅列标题 
-- **12.4 Decomposition methods** 下，"Cell decomposition"和"Approximate decompositions for complex environments (e.g. IRIS)"仅列标题 
-- **12.4.1 之后的内容**（如 GCS 的具体算法、IRIS 的 SDP 公式）PDF 中未展开
-- 在线版本（underactuated.mit.edu）可能已有更新 ，建议结合最新在线版本和 Drake Notebook 实操
-
-教材参考文献 [1]-[4] 的核心结论都已融入讲解：
-- LaValle 2006：规划算法圣经
-- Helmert 2006：Fast Downward 规划系统
-- Amato & Wu 1996：随机路线图方法
-- Amice et al. 2024：双臂 RRT 运动计划的秒级认证
-
----
-
-## 🎯 十二、给你的实践建议
-
-如果你想真正掌握这一章，建议按以下顺序动手：
-
-1. **第一步**：在2D环境中实现基础 RRT（处理简单障碍物）
-2. **第二步**：加入目标偏置，观察收敛速度的提升
-3. **第三步**：实现 RRT*，可视化"重连"操作，观察路径代价的单调下降
-4. **第四步**：在 Drake 中运行官方的 RRT Notebook（Exercise 12.1）
-5. **第五步**：尝试 Kinodynamic-RRT*，用简单动力学系统（如小车模型）
-6. **第六步**：在 MoveIt + OMPL 中配置 RRT* / BIT*，规划6自由度机械臂路径
-
-> 💡 **关键认知**：RRT/RRT* 看似简单，但**调参（步长、偏置、重连半径）是艺术**。只有通过大量实验，你才能真正理解这些算法的行为特征。
-
----
-
-如果你回我三件事，把**「MPC 与采样规划是上下游：采样规划在高维构型空间生成几何路径，MPC 在动力学层面跟踪这条路径——两者互补解决'去哪里'与'怎么去'，前轮没钉过』** + **「RRT* 的渐近最优性与第11章策略搜索 PL 条件呼应：两者都通过'样本/迭代数量趋近无穷'获得最优性保证，是现代机器人规划与学习的统一数学语言，前轮没钉过』** + **「HALOS 安全层与采样的深度集成：传统采样只考虑几何碰撞，HALOS 在构型空间定义禁区，采样时拒绝进入禁区的点，RRT 树天然满足安全约束——比紧急停机更主动，前轮没钉过』** 三件写成"采样规划→你栈升舱"的起跑器。
+| 章节开篇 | ✅ 完整讲解 | 系统模型新增 y 和 v；之前假设全状态反馈的限制 |
+| "全状态反馈假设没那么糟" | ✅ 完整讲解 | 滤波器引入动力学；时间常数接近时需要纳入分析 |
+| "完全不可观的状态变量" | ✅ 完整讲解 | 需要"信息收集"动作 |
+| 机器人操作案例（扣纽扣、做沙拉）| ✅ 完整讲解 | 任务相关状态表示的重要性 |
+| 15.1.1 经典控制视角 | ✅ 完整讲解 | 传递函数、极点配置、回路整形；现代控制的得与失 |
+| 15.1.2 从像素到力矩 | ✅ 完整讲解 | 深度学习革命；模仿学习与强化学习；教师-学生蒸馏 |
+| 15.2 静态输出反馈 | ✅ 完整讲解 | |
+| 15.2.1 硬度结果 | ✅ 完整讲解 | Blondel & Tsitsiklis 1997 的 NP-hard 结论；稳定 K 集合非凸且不连通；Megretski 三阶反例 |
+| 15.2.2 历史观察的必要性 | ✅ 完整讲解 | Acrobot/Cart-Pole 平衡需要速度信息；历史观察的合理性；动态控制器的需求 |
+| 15.3 POMDPs | ✅ 完整讲解 | |
+| POMDP 形式化定义 | ✅ 完整讲解 | 状态、动作、观察、转移、观察概率、代价 |
+| 信念状态作为充分统计量 | ✅ 完整讲解 | $b_i[n] = P(s[n]=s_i \mid history)$；最优策略 $\pi^*(b[n], n)$ |
+| 贝叶斯更新方程 | ✅ 完整讲解 | 矩阵形式的 $f(b,a,o)$；信念 MDP |
+| 连续状态空间的信念 | ✅ 完整讲解 | $b(x,n) = p_{x\|h}(x[n]\|h[n])$ |
+| Example 15.1 奶酪迷宫 | ✅ 完整讲解 | 7个信念状态的最优策略 |
+| POMDP 文献综述 | ✅ 提到 | Lauri et al. 2022 的调查 |
+| 15.4 线性系统 + 高斯噪声 | ✅ 框架讲解 | |
+| 15.4.1 LQG | ⚠️ PDF 仅列标题 | 分离原理；"在线性高斯下最优，但一般不是最优" |
+| 15.4.2 迭代 LQG 轨迹优化 | ⚠️ PDF 仅列标题 | 未展开 |
+| 15.5 基于观测器的反馈 | ✅ 框架讲解 | |
+| 分离原理 | ✅ 完整讲解 | "在 LQG 下最优，但一般不是最优" |
+| 15.5.1 Luenberger 观测器 | ⚠️ PDF 仅列标题 | 给出了观测器方程框架 |
+| 15.6 基于扰动的反馈 | ✅ 完整讲解 | 系统模型；输出反馈参数化 $u[n]=K_0[n]y[0]+\sum K_i[n]e[n-i
